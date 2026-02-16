@@ -1,0 +1,164 @@
+CREATE OR REPLACE VIEW XXXX_SANDBOX.AMY_P.DEMINIMIS AS
+
+WITH base_q AS (
+    SELECT
+        cdd.CDD_ID, 
+        cdd.trading_name, 
+        cdd."12M_NET_REV", 
+        cdd.risk_rating, 
+        cdd.last_txn_date, 
+        cdd.last_reviewed,
+        cdd.next_review, 
+        cdd.ultimate_parent, 
+        cdd.ultimate_parent_name,
+        cdd.trigger_event, 
+        cdd.M_LEVEL,
+        cdd.WPAP,
+        cdd.days_past_due_banding,
+        cdd.NEXT_REVIEW_BAND,
+        cdd.DUE_STATUS,
+        cdd.dormant,
+    
+        
+        b.SC_SUB_STATUS__C AS SALESFORCE_SUBSTATUS,
+        b.SYSTEMMODSTAMP AS SUBSTATUS_MODIFIED,
+        b.CREATED_DATE__C AS SALESFORCE_CREATED_DATE,
+        a.LETTER_ONE_SEND_EMAIL_DATE__C AS SALESFORCE_L1_DATE,
+        a.LETTER_TWO_SEND_EMAIL_DATE__C AS SALESFORCE_L2_DATE,
+        a.LETTER_THREE_SEND_EMAIL_DATE__C AS SALESFORCE_L3_DATE,
+        b.ACCOUNT_MID__C AS SALESFORCE_CASENUM,
+        b.ASSIGNMENT_SUB_GROUP__C AS SF_ASSIGNMENT_SUB_GROUP,
+
+        COALESCE(letters.Letter, 'Not Started') AS Letter,
+        letters.LETTER_DATE,
+        DATEDIFF('day', letters.LETTER_DATE, CURRENT_DATE) AS days_since_letter,
+
+        -- Flags from ANR and Exceptions (pre-aggregated)
+        CASE WHEN anr.cdd_id IS NOT NULL THEN 1 ELSE 0 END AS SENT_TO_EXIT,
+        exc.MAX_EXCEPTION_END_DATE AS EXCEPTION_END_DATE,
+        CASE 
+            WHEN exc.MAX_EXCEPTION_END_DATE IS NOT NULL 
+             AND exc.MAX_EXCEPTION_END_DATE >= CURRENT_DATE THEN 1
+            ELSE 0
+        END AS EXCEPTION_ACTIVE_FLAG,
+
+        -- Rank outreach progress to remove multiple lines per case
+        ROW_NUMBER() OVER (
+            PARTITION BY cdd.CDD_ID
+            ORDER BY 
+                CASE 
+                    WHEN a.LETTER_THREE_SEND_EMAIL_DATE__C IS NOT NULL THEN 3
+                    WHEN a.LETTER_TWO_SEND_EMAIL_DATE__C IS NOT NULL THEN 2
+                    WHEN a.LETTER_ONE_SEND_EMAIL_DATE__C IS NOT NULL THEN 1
+                    ELSE 0
+                END DESC,
+                b.CREATED_DATE__C DESC
+        ) AS outreach_rank,
+
+        -- Overdue logic (consistent defaults + normalized names)
+        CASE 
+            WHEN letters.Letter IS NULL THEN 'Yes'  -- Not Started
+            WHEN letters.Letter IN ('Letter 1', 'Letter 2', 'Letter 2B') THEN 
+                CASE 
+                    WHEN DATEDIFF('day', letters.LETTER_DATE, CURRENT_DATE) >= 32 THEN 'Yes'
+                    WHEN DATEDIFF('day', letters.LETTER_DATE, CURRENT_DATE) BETWEEN 24 AND 31 THEN 'Approaching Overdue'
+                    ELSE 'No' 
+                END
+            WHEN letters.Letter IN ('Letter 3', 'Letter 3a', 'Letter 3B') THEN 
+                CASE 
+                    WHEN DATEDIFF('day', letters.LETTER_DATE, CURRENT_DATE) > 120 THEN 'Yes'
+                    WHEN DATEDIFF('day', letters.LETTER_DATE, CURRENT_DATE) BETWEEN 113 AND 120 THEN 'Approaching Overdue'
+                    ELSE 'No' 
+                END
+            ELSE 'No'
+        END AS Overdue
+
+    FROM XXXX_SANDBOX.XXXXX.CDD_XXXXX_COMBINED cdd
+
+    -- SALESFORCE letters only (SC view), normalized and latest per CDD_ID
+    LEFT JOIN (
+        SELECT CDD_ID, LETTER_DATE, Letter
+        FROM (
+            SELECT 
+                CDD_ID, 
+                LETTER_DATE, 
+                CASE 
+                    WHEN Letter = 'Letter 2.1' THEN 'Letter 2'
+                    WHEN Letter = 'Letter 2a'  THEN 'Letter 2'
+                    WHEN Letter = 'Letter 3A'  THEN 'Letter 3a'
+                    ELSE Letter
+                END AS Letter,
+                ROW_NUMBER() OVER (
+                    PARTITION BY CDD_ID
+                    ORDER BY LETTER_DATE DESC
+                ) AS rn
+            FROM XXXX_SANDBOX.XXXX_CDD_Letters_SC_VW
+            WHERE Letter != 'Letter 4'
+              AND LETTER_DATE <= CURRENT_DATE
+        )
+        WHERE rn = 1
+    ) letters
+        ON cdd.CDD_ID = letters.CDD_ID
+
+    LEFT JOIN (
+        SELECT *
+        FROM XXXXX_SALESFORCE.XXXX_CASE
+        WHERE ORIGIN IN ('Phone', 'API-UK FICO')
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY CASENUMBER 
+            ORDER BY DWM_SOURCE_TIMESTAMP DESC
+        ) = 1
+    ) b 
+        ON b.SC_PO_LOCALENTITY__C = cdd.CDD_ID
+
+    LEFT JOIN XXXX_SALESFORCE.XXXX_CDD_WORKFLOW__C a
+        ON a.case__c = b.ID
+
+    -- Pre-aggregated Exceptions: max end date per CDD_ID
+    LEFT JOIN (
+        SELECT 
+            cdd_id, 
+            MAX(EXCEPTION_END_DATE) AS MAX_EXCEPTION_END_DATE
+        FROM XXXXX_SANDBOX.AMY_P_XXXX_CLOSURE_EXCEPTIONS
+        GROUP BY cdd_id
+    ) exc
+        ON exc.cdd_id = cdd.CDD_ID
+
+    -- Pre-aggregated ANR: distinct CDD_ID presence
+    LEFT JOIN (
+        SELECT DISTINCT cdd_id
+        FROM XXXX_SANDBOX.AMY_P.CLOSURE_ANR
+    ) anr
+        ON anr.cdd_id = cdd.CDD_ID
+
+    -- FILTERS
+    WHERE cdd.current_flag = 'Y'
+      AND cdd.trigger_event = 0
+      AND cdd.WPUK = 1
+
+    -- dedupe to the single â€œbestâ€ outreach row
+    QUALIFY outreach_rank = 1
+)
+
+SELECT
+    base_q.*,
+    CASE 
+      WHEN Overdue IN ('No', 'Approaching Overdue') THEN 'Up to Date with Lettering'
+      WHEN 
+        -- Normalize Substatus: replace NBSP, collapse spaces, trim, uppercase
+        REGEXP_REPLACE(
+          TRIM(REGEXP_REPLACE(REPLACE(UPPER(SALESFORCE_SUBSTATUS), '\u00A0', ' '), '\\s+', ' ')),
+          '\\s+', ' '
+        ) IN (
+          'ESCALATIONS: SPDD REVIEW REQUIRED',
+          'PENDING INTERNAL',
+          'ESCALATIONS: PEP/SOE/NEGATIVE NEWS REFERRAL'
+        )
+        OR UPPER(COALESCE(SF_ASSIGNMENT_SUB_GROUP, '')) = 'SPDD'
+        OR M_LEVEL = 1
+        OR WPAP = 1
+      THEN 'Overdue - Valid Rationale'
+      ELSE 'Overdue - No Valid Rationale'
+    END AS Overdue_Rationale
+FROM base_q
+ORDER BY days_since_letter ASC NULLS LAST;
